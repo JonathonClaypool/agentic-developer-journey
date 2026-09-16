@@ -12,28 +12,31 @@ class CatalogEntry:
 
 RESOURCE_CATALOG: dict[ResourceKey, CatalogEntry] = {
     "foundry": CatalogEntry(
-        "New Microsoft Foundry account and project", "core-ai.bicep", ("managed-identity",)
+        "Project in the platform Microsoft Foundry account", "modules/foundry.bicep"
     ),
     "chat-model": CatalogEntry(
-        "Foundry chat model deployment", "core-ai.bicep", ("foundry",)
+        "Workload chat model deployment", "modules/foundry.bicep", ("foundry",)
     ),
     "embedding-model": CatalogEntry(
-        "Foundry embedding model deployment", "core-ai.bicep", ("foundry",)
+        "Workload embedding model deployment", "modules/foundry.bicep", ("foundry",)
     ),
     "managed-identity": CatalogEntry(
-        "User-assigned managed identity", "identity.bicep"
+        "Platform-managed identity reference", "main.bicep"
     ),
     "storage": CatalogEntry(
-        "Storage account", "data.bicep", ("managed-identity",)
+        "Container in the platform Storage account", "modules/storage-container.bicep"
+    ),
+    "cosmos": CatalogEntry(
+        "Container in the platform Cosmos DB database", "modules/cosmos-container.bicep"
     ),
     "ai-search": CatalogEntry(
-        "Azure AI Search", "data.bicep", ("managed-identity",)
+        "Existing platform Azure AI Search index reference", "main.bicep"
     ),
     "observability": CatalogEntry(
-        "Application Insights and Log Analytics", "observability.bicep"
+        "Platform observability reference", "main.bicep"
     ),
     "private-network": CatalogEntry(
-        "Virtual network and private connectivity", "networking.bicep"
+        "Platform private network boundary", "main.bicep"
     ),
 }
 
@@ -61,28 +64,27 @@ def to_bicep_parameters(manifest: DeploymentManifest) -> dict[str, object]:
     resources = resolve_resources(manifest.resources)
     has = resources.__contains__
     embedding = manifest.embedding_model
-    requirements = manifest.operational_requirements
-    production = (
-        requirements.environments == "dev-test-prod"
-        or requirements.service_hours == "24x7"
-        or requirements.business_impact == "material"
-        or requirements.rto_minutes <= 240
-    )
+    platform = manifest.platform_resources
     return {
         "workloadName": manifest.workload_name,
         "location": manifest.location,
-        "deployFoundry": has("foundry"),
+        "foundryResourceGroupName": platform.foundry_resource_group,
+        "foundryAccountName": platform.foundry_account_name,
+        "storageResourceGroupName": platform.storage_resource_group,
+        "storageAccountName": platform.storage_account_name,
+        "cosmosResourceGroupName": platform.cosmos_resource_group,
+        "cosmosAccountName": platform.cosmos_account_name,
+        "cosmosDatabaseName": platform.cosmos_database_name,
+        "searchResourceGroupName": platform.search_resource_group,
+        "searchServiceName": platform.search_service_name,
+        "searchIndexName": platform.search_index_name,
+        "managedIdentityResourceId": platform.managed_identity_resource_id,
+        "deployFoundryProject": has("foundry"),
         "deployChatModel": has("chat-model"),
         "deployEmbeddingModel": has("embedding-model"),
-        "deployIdentity": has("managed-identity"),
-        "deployStorage": has("storage"),
-        "deploySearch": has("ai-search"),
-        "deployObservability": has("observability"),
-        "deployPrivateNetwork": has("private-network"),
-        "storageSku": "Standard_GZRS" if production else "Standard_LRS",
-        "searchSku": "standard" if production else "basic",
-        "searchReplicaCount": 2 if production else 1,
-        "logRetentionDays": max(requirements.retention_days, 90 if production else 30),
+        "deployStorageContainer": has("storage"),
+        "deployCosmosContainer": has("cosmos"),
+        "referenceSearchIndex": has("ai-search"),
         "chatModelName": manifest.chat_model.name,
         "chatModelVersion": manifest.chat_model.version,
         "chatModelSku": manifest.chat_model.sku,
@@ -91,5 +93,6 @@ def to_bicep_parameters(manifest: DeploymentManifest) -> dict[str, object]:
         "embeddingModelVersion": embedding.version if embedding else "1",
         "embeddingModelSku": embedding.sku if embedding else "GlobalStandard",
         "embeddingModelCapacity": embedding.capacity if embedding else 10,
+        "cosmosPartitionKeyPath": manifest.cosmos_partition_key_path,
         "tags": manifest.tags,
     }

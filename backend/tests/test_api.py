@@ -1,19 +1,40 @@
+import os
+from pathlib import Path
+
+os.environ.setdefault("PACKAGE_ARTIFACT_BACKEND", "filesystem")
+os.environ.setdefault("AZURE_SUBSCRIPTION_ID", "cdcf2cb6-afa4-4076-abe1-ac97a899a308")
+os.environ.setdefault("PLATFORM_LOCATION", "eastus2")
+os.environ.setdefault("PLATFORM_FOUNDRY_RESOURCE_GROUP", "rg-platform-ai")
+os.environ.setdefault("PLATFORM_FOUNDRY_ACCOUNT_NAME", "aif-platform")
+os.environ.setdefault("PLATFORM_STORAGE_RESOURCE_GROUP", "rg-platform-data")
+os.environ.setdefault("PLATFORM_STORAGE_ACCOUNT_NAME", "stplatformdata")
+os.environ.setdefault("PLATFORM_COSMOS_RESOURCE_GROUP", "rg-platform-data")
+os.environ.setdefault("PLATFORM_COSMOS_ACCOUNT_NAME", "cosmos-platform")
+os.environ.setdefault("PLATFORM_COSMOS_DATABASE_NAME", "applications")
+os.environ.setdefault("PLATFORM_SEARCH_RESOURCE_GROUP", "rg-platform-ai")
+os.environ.setdefault("PLATFORM_SEARCH_SERVICE_NAME", "srch-platform")
+os.environ.setdefault("PLATFORM_SEARCH_INDEX_NAME", "approved-content")
+os.environ.setdefault(
+    "PLATFORM_MANAGED_IDENTITY_RESOURCE_ID",
+    "/subscriptions/cdcf2cb6-afa4-4076-abe1-ac97a899a308/resourceGroups/rg-platform-ai/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-platform",
+)
+
 from fastapi.testclient import TestClient
 import connectors.azure_cli as azure_deployment
 import routers.deployments as deployments_router
-import services.region_assessment as region_assessment
 
 from main import app
 from models.schemas import DeploymentManifest
+from services.agent_starter_generator import _resource_values
 
 client = TestClient(app)
 
 PACKAGE_REQUEST = {
+    "provisioningMode": "existing-resources",
     "applicationId": "AI-2026-0118",
     "location": "eastus2",
-    "resourceGroupName": "rg-quality-rag-poc-eus2",
     "workloadName": "quality-rag-poc",
-    "resources": ["ai-search", "storage", "embedding-model", "chat-model"],
+    "resources": ["ai-search", "storage", "cosmos", "embedding-model", "chat-model"],
     "chatModel": {
         "name": "gpt-5-mini",
         "version": "2025-08-07",
@@ -26,7 +47,22 @@ PACKAGE_REQUEST = {
         "sku": "GlobalStandard",
         "capacity": 10,
     },
+    "cosmosPartitionKeyPath": "/applicationId",
     "tags": {"environment": "poc"},
+}
+
+PLATFORM_RESOURCES = {
+    "foundryResourceGroup": "rg-platform-ai",
+    "foundryAccountName": "aif-platform",
+    "storageResourceGroup": "rg-platform-data",
+    "storageAccountName": "stplatformdata",
+    "cosmosResourceGroup": "rg-platform-data",
+    "cosmosAccountName": "cosmos-platform",
+    "cosmosDatabaseName": "applications",
+    "searchResourceGroup": "rg-platform-ai",
+    "searchServiceName": "srch-platform",
+    "searchIndexName": "approved-content",
+    "managedIdentityResourceId": os.environ["PLATFORM_MANAGED_IDENTITY_RESOURCE_ID"],
 }
 
 
@@ -114,11 +150,11 @@ def test_architecture_planner_derives_standard_production_controls() -> None:
     assert {control["id"] for control in plan["controls"]} >= {"audit-retention", "immutable-audit"}
     changes = plan["infrastructureChanges"]
     assert changes["additionalInfrastructure"] == []
-    assert changes["summary"] == "No additional Azure services are required; 3 existing components will be production-hardened."
+    assert changes["summary"] == "No additional Azure services are required; 2 existing components will be production-hardened."
     change_by_resource = {change["resource"]: change for change in changes["existingInfrastructure"]}
-    assert change_by_resource["storage"]["status"] == "upgraded"
-    assert change_by_resource["storage"]["target"].startswith("Standard_GZRS")
-    assert change_by_resource["ai-search"]["status"] == "scaled"
+    assert change_by_resource["storage"]["status"] == "new"
+    assert change_by_resource["storage"]["target"] == "New workload Blob container"
+    assert change_by_resource["ai-search"]["status"] == "unchanged"
     assert change_by_resource["observability"]["status"] == "reconfigured"
 
 
@@ -154,29 +190,30 @@ def test_approval_generates_compiled_bicep_package() -> None:
     package = response.json()
     keys = [resource["key"] for resource in package["resourceDetails"]]
     assert keys == [
-        "managed-identity",
         "ai-search",
         "storage",
+        "cosmos",
         "foundry",
         "embedding-model",
         "chat-model",
     ]
     assert len(package["sha256"]) == 64
     files = {item["path"]: item["content"] for item in package["files"]}
-    assert {"main.bicep", "resources.bicep", "main.bicepparam"} <= files.keys()
-    assert "param resourceGroupName = 'rg-quality-rag-poc-eus2'" in files["main.bicepparam"]
+    assert {
+        "main.bicep",
+        "modules/foundry.bicep",
+        "modules/storage-container.bicep",
+        "modules/cosmos-container.bicep",
+        "main.bicepparam",
+    } <= files.keys()
+    assert "param foundryAccountName = 'aif-platform'" in files["main.bicepparam"]
+    assert "param cosmosPartitionKeyPath = '/applicationId'" in files["main.bicepparam"]
     assert "param deploymentStamp = '" in files["main.bicepparam"]
-    assert "Microsoft.CognitiveServices/accounts/projects" in files["resources.bicep"]
-    assert "resource foundryAccount 'Microsoft.CognitiveServices/accounts@" in files["resources.bicep"]
-    assert "resource foundryProject 'Microsoft.CognitiveServices/accounts/projects@" in files["resources.bicep"]
-    assert "location: location" in files["resources.bicep"]
-    assert "dependsOn: [\n    foundryProject\n  ]" in files["resources.bicep"]
-    assert "dependsOn: [\n    chatModel\n  ]" in files["resources.bicep"]
-    assert "param deployPrivateNetwork = false" in files["main.bicepparam"]
-    assert "publicNetworkAccess: deployPrivateNetwork ? 'Disabled' : 'Enabled'" in files["resources.bicep"]
-    assert "defaultAction: deployPrivateNetwork ? 'Deny' : 'Allow'" in files["resources.bicep"]
-    assert "disableLocalAuth: true" in files["resources.bicep"]
-    assert "allowSharedKeyAccess: false" in files["resources.bicep"]
+    assert "Microsoft.CognitiveServices/accounts/projects" in files["modules/foundry.bicep"]
+    assert "Microsoft.Storage/storageAccounts@2023-05-01' existing" in files["modules/storage-container.bicep"]
+    assert "Microsoft.DocumentDB/databaseAccounts@2024-05-15' existing" in files["modules/cosmos-container.bicep"]
+    assert "Microsoft.Resources/resourceGroups" not in files["main.bicep"]
+    assert "Microsoft.Search/searchServices@" not in files["main.bicep"]
 
     retrieved = client.get(f"/api/packages/{package['packageId']}")
     assert retrieved.status_code == 200
@@ -252,7 +289,6 @@ def test_successful_deployment_outputs_populate_starter_connections(monkeypatch)
     request = {
         **PACKAGE_REQUEST,
         "applicationId": "AI-2026-outputs",
-        "resourceGroupName": "rg-output-capture-poc-eus2",
         "workloadName": "output-capture-poc",
     }
     package = client.post("/api/packages", json=request).json()
@@ -341,10 +377,11 @@ def test_what_if_requests_machine_readable_json(monkeypatch) -> None:
         {
             **PACKAGE_REQUEST,
             "subscriptionId": "cdcf2cb6-afa4-4076-abe1-ac97a899a308",
+            "platformResources": PLATFORM_RESOURCES,
         }
     )
 
-    response = azure_deployment.run_what_if(manifest, "abc123")
+    response = azure_deployment.run_what_if(manifest, "abc123", Path("main.bicep"))
 
     assert "--no-pretty-print" in captured_args
     assert captured_args[captured_args.index("--name") + 1] == "whatif-quality-rag-poc-eastus2"
@@ -366,10 +403,11 @@ def test_deploy_submits_without_waiting(monkeypatch) -> None:
         {
             **PACKAGE_REQUEST,
             "subscriptionId": "cdcf2cb6-afa4-4076-abe1-ac97a899a308",
+            "platformResources": PLATFORM_RESOURCES,
         }
     )
 
-    response = azure_deployment.deploy(manifest, "abc123")
+    response = azure_deployment.deploy(manifest, "abc123", Path("main.bicep"))
 
     assert "--no-wait" in captured_args
     assert "deploymentStamp=abc123" in captured_args
@@ -377,55 +415,106 @@ def test_deploy_submits_without_waiting(monkeypatch) -> None:
     assert response["deploymentName"].startswith("quality-rag-poc-")
 
 
-def test_region_assessment_checks_models_quota_and_capacity_caveat(monkeypatch) -> None:
-    def fake_run_azure(args: list[str], *, expect_json: bool = True):
-        if args[:2] == ["provider", "show"]:
-            namespace = args[args.index("--namespace") + 1]
-            resource_types = {
-                "Microsoft.CognitiveServices": "accounts",
-                "Microsoft.ManagedIdentity": "userAssignedIdentities",
-                "Microsoft.Storage": "storageAccounts",
-                "Microsoft.Search": "searchServices",
-            }
-            return {
-                "resourceTypes": [
-                    {
-                        "resourceType": resource_types[namespace],
-                        "locations": ["East US", "East US 2", "West US 3"],
-                    }
-                ]
-            }
-        if args[:3] == ["cognitiveservices", "model", "list"]:
-            return [
-                {
-                    "model": {
-                        "name": "gpt-5-mini",
-                        "version": "2025-08-07",
-                        "skus": [{"name": "GlobalStandard"}],
-                    }
-                },
-                {
-                    "model": {
-                        "name": "text-embedding-3-small",
-                        "version": "1",
-                        "skus": [{"name": "GlobalStandard"}],
-                    }
-                },
-            ]
-        if args[:3] == ["cognitiveservices", "usage", "list"]:
-            return [
-                {"name": {"value": "OpenAI.GlobalStandard.gpt-5-mini"}, "currentValue": 0, "limit": 100},
-                {"name": {"value": "OpenAI.GlobalStandard.text-embedding-3-small"}, "currentValue": 10, "limit": 100},
-            ]
-        raise AssertionError(args)
+def test_deployment_status_expands_nested_module_operations(monkeypatch) -> None:
+    subscription_id = "cdcf2cb6-afa4-4076-abe1-ac97a899a308"
+    module_id = (
+        f"/subscriptions/{subscription_id}/resourceGroups/rg-platform-ai/"
+        "providers/Microsoft.Resources/deployments/checkout-foundry-abc123"
+    )
+    project_id = (
+        f"/subscriptions/{subscription_id}/resourceGroups/rg-platform-ai/"
+        "providers/Microsoft.CognitiveServices/accounts/aif-platform/projects/proj-test"
+    )
 
-    monkeypatch.setattr(region_assessment, "_run_azure", fake_run_azure)
+    def fake_run_azure(args: list[str], *, expect_json: bool = True) -> object:
+        if args[:3] == ["deployment", "sub", "show"]:
+            return {"properties": {"provisioningState": "Running"}}
+        if args[:5] == ["deployment", "operation", "sub", "list", "--subscription"]:
+            return [
+                {
+                    "properties": {
+                        "provisioningState": "Succeeded",
+                        "targetResource": {
+                            "id": module_id,
+                            "resourceName": "checkout-foundry-abc123",
+                            "resourceType": "Microsoft.Resources/deployments",
+                        },
+                    }
+                }
+            ]
+        if args[:4] == ["deployment", "operation", "group", "list"]:
+            return [
+                {
+                    "properties": {
+                        "provisioningState": "Succeeded",
+                        "targetResource": {
+                            "id": project_id,
+                            "resourceName": "proj-test",
+                            "resourceType": "Microsoft.CognitiveServices/accounts/projects",
+                        },
+                    }
+                }
+            ]
+        raise AssertionError(f"Unexpected Azure CLI arguments: {args}")
+
+    monkeypatch.setattr(azure_deployment, "_run_azure", fake_run_azure)
+    manifest = DeploymentManifest.model_validate(
+        {
+            **PACKAGE_REQUEST,
+            "subscriptionId": subscription_id,
+            "platformResources": PLATFORM_RESOURCES,
+        }
+    )
+
+    status = azure_deployment.deployment_status(manifest, "quality-rag-poc-12345678")
+
+    assert status["resources"] == [
+        {
+            "resourceId": project_id,
+            "name": "proj-test",
+            "type": "Microsoft.CognitiveServices/accounts/projects",
+            "state": "Succeeded",
+            "error": None,
+        }
+    ]
+
+
+def test_planned_starter_values_exclude_unapproved_platform_resources() -> None:
+    manifest = DeploymentManifest.model_validate(
+        {
+            **PACKAGE_REQUEST,
+            "resources": ["chat-model"],
+            "embeddingModel": None,
+            "subscriptionId": "cdcf2cb6-afa4-4076-abe1-ac97a899a308",
+            "platformResources": PLATFORM_RESOURCES,
+        }
+    )
+
+    values = _resource_values(manifest, None, "pkg-1234567890ab")
+
+    assert values["MODEL_DEPLOYMENT_NAME"] == "gpt-5-mini-123456"
+    assert values["STORAGE_BLOB_ENDPOINT"] == ""
+    assert values["AZURE_STORAGE_RESOURCE_ID"] == ""
+    assert values["AZURE_SEARCH_ENDPOINT"] == ""
+    assert values["AZURE_SEARCH_RESOURCE_ID"] == ""
+
+
+def test_package_rejects_malformed_cosmos_partition_key() -> None:
+    response = client.post(
+        "/api/packages",
+        json={**PACKAGE_REQUEST, "cosmosPartitionKeyPath": "/tenant//id"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_region_assessment_uses_configured_platform_profile() -> None:
     response = client.post(
         "/api/regions/assess",
         json={
             "subscriptionId": "cdcf2cb6-afa4-4076-abe1-ac97a899a308",
             "preferredRegion": "eastus2",
-            "candidateRegions": ["eastus2", "eastus", "westus3"],
+            "candidateRegions": ["eastus2"],
             "resources": ["foundry", "managed-identity", "storage", "ai-search", "chat-model", "embedding-model"],
             "chatModel": PACKAGE_REQUEST["chatModel"],
             "embeddingModel": PACKAGE_REQUEST["embeddingModel"],
@@ -433,16 +522,10 @@ def test_region_assessment_checks_models_quota_and_capacity_caveat(monkeypatch) 
     )
     assert response.status_code == 200
     result = response.json()
-    assert result["recommendedRegion"] == "eastus"
-    assert result["regions"][0]["region"] == "eastus"
+    assert result["recommendedRegion"] == "eastus2"
+    assert result["regions"][0]["region"] == "eastus2"
     assert result["regions"][0]["status"] == "conditional"
     checks = {check["name"]: check for check in result["regions"][0]["checks"]}
-    assert checks["gpt-5-mini"]["status"] == "pass"
-    assert checks["text-embedding-3-small"]["status"] == "pass"
-    assert checks["Azure AI Search live capacity"]["status"] == "warn"
-    east_us_2 = next(region for region in result["regions"] if region["region"] == "eastus2")
-    west_us_3 = next(region for region in result["regions"] if region["region"] == "westus3")
-    assert east_us_2["status"] == "blocked"
-    assert west_us_3["status"] == "blocked"
-    assert any(check["name"] == "Recent POC deployment evidence" for check in east_us_2["checks"])
-    assert any(check["name"] == "Recent POC deployment evidence" for check in west_us_3["checks"])
+    assert checks["Platform resource profile"]["status"] == "pass"
+    assert checks["gpt-5-mini"]["status"] == "warn"
+    assert checks["text-embedding-3-small"]["status"] == "warn"

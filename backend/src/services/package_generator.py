@@ -3,24 +3,40 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
-from core.config import GENERATED_PACKAGES_ROOT, INFRASTRUCTURE_ROOT
+from core.config import INFRASTRUCTURE_ROOT
+from core.platform_resources import get_platform_resource_profile
 from domain.resource_catalog import describe_resources, resolve_resources, to_bicep_parameters
-from models.schemas import ArchitecturePackageRequest, DeploymentManifest
-from models.schemas import ArchitecturePlanRequest
+from models.schemas import (
+    ArchitecturePackageRequest,
+    ArchitecturePlanRequest,
+    DeploymentManifest,
+    PlatformResourceReferences,
+)
 from services.architecture_planner import create_architecture_plan
+from services.artifact_repository import (
+    ArtifactNotFoundError,
+    get_artifact_repository,
+    package_path,
+)
 
 CATALOG_ROOT = INFRASTRUCTURE_ROOT
-GENERATED_ROOT = GENERATED_PACKAGES_ROOT
 PACKAGE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
 class PackageError(RuntimeError):
     pass
+
+
+def _validate_package_id(package_id: str) -> None:
+    if not PACKAGE_ID_PATTERN.fullmatch(package_id):
+        raise PackageError("Invalid package ID.")
 
 
 def _bicep_value(value: Any, indent: int = 0) -> str:
@@ -40,37 +56,29 @@ def _bicep_value(value: Any, indent: int = 0) -> str:
     raise PackageError(f"Unsupported Bicep parameter value: {type(value).__name__}")
 
 
-def _as_manifest(
-    request: ArchitecturePackageRequest,
-    subscription_id: str,
-) -> DeploymentManifest:
+def _as_manifest(request: ArchitecturePackageRequest) -> DeploymentManifest:
+    profile = get_platform_resource_profile()
+    if request.location != profile.location:
+        raise PackageError(
+            f"Packages must use the configured platform location {profile.location}."
+        )
     return DeploymentManifest(
-        subscriptionId=subscription_id,
-        location=request.location,
-        resourceGroupName=request.resource_group_name,
-        workloadName=request.workload_name,
-        resources=request.resources,
-        chatModel=request.chat_model,
-        embeddingModel=request.embedding_model,
-        operationalRequirements=request.operational_requirements,
-        tags=request.tags,
+        **request.model_dump(by_alias=True),
+        subscriptionId=profile.subscription_id,
+        platformResources=PlatformResourceReferences.model_validate(
+            profile.model_dump(by_alias=True)
+        ),
     )
 
 
-def _package_directory(package_id: str) -> Path:
-    if not PACKAGE_ID_PATTERN.fullmatch(package_id):
-        raise PackageError("Invalid package ID.")
-    directory = (GENERATED_ROOT / package_id).resolve()
-    if GENERATED_ROOT.resolve() not in directory.parents:
-        raise PackageError("Invalid package path.")
-    return directory
-
-
 def _compile_bicep(directory: Path) -> None:
+    azure_cli = shutil.which("az")
+    if not azure_cli:
+        raise PackageError("Azure CLI with Bicep is required to generate packages.")
     try:
         subprocess.run(
             [
-                "az",
+                azure_cli,
                 "bicep",
                 "build",
                 "--file",
@@ -82,8 +90,6 @@ def _compile_bicep(directory: Path) -> None:
             capture_output=True,
             text=True,
         )
-    except FileNotFoundError as error:
-        raise PackageError("Azure CLI with Bicep is required to generate packages.") from error
     except subprocess.CalledProcessError as error:
         detail = error.stderr.strip() or error.stdout.strip() or "Bicep compilation failed."
         raise PackageError(detail) from error
@@ -103,47 +109,72 @@ def _resource_types(value: Any) -> list[str]:
     return resource_types
 
 
-def _enforce_foundry_topology(directory: Path) -> None:
+def _enforce_existing_resource_topology(directory: Path) -> None:
     compiled = json.loads((directory / "main.json").read_text(encoding="utf-8"))
-    resource_types = _resource_types(compiled)
-    account_type = "microsoft.cognitiveservices/accounts"
-    project_type = "microsoft.cognitiveservices/accounts/projects"
-    if account_type not in resource_types:
+    resource_types = set(_resource_types(compiled))
+    forbidden = {
+        "microsoft.resources/resourcegroups",
+        "microsoft.cognitiveservices/accounts",
+        "microsoft.storage/storageaccounts",
+        "microsoft.documentdb/databaseaccounts",
+        "microsoft.search/searchservices",
+        "microsoft.managedidentity/userassignedidentities",
+        "microsoft.network/virtualnetworks",
+    }
+    created_forbidden = sorted(forbidden & resource_types)
+    if created_forbidden:
         raise PackageError(
-            "Safety check failed: the package does not contain a Microsoft Foundry account."
+            "Safety check failed: package creates platform parent resources: "
+            + ", ".join(created_forbidden)
         )
-    if project_type not in resource_types:
-        raise PackageError(
-            "Safety check failed: the package does not contain a Microsoft Foundry project."
-        )
+    if "microsoft.cognitiveservices/accounts/projects" not in resource_types:
+        raise PackageError("Safety check failed: package does not create a Foundry project.")
 
 
 def _hash_files(directory: Path, names: list[str]) -> str:
     digest = hashlib.sha256()
     for name in sorted(names):
-        digest.update(name.encode())
+        digest.update(name.encode("utf-8"))
         digest.update((directory / name).read_bytes())
     return digest.hexdigest()
 
 
-def create_package(request: ArchitecturePackageRequest) -> dict[str, object]:
-    missing_templates = [
-        path.name
-        for path in (CATALOG_ROOT / "main.bicep", CATALOG_ROOT / "resources.bicep")
-        if not path.is_file()
-    ]
-    if missing_templates:
-        raise PackageError(
-            "Canonical Bicep template missing: " + ", ".join(missing_templates)
+def _source_files(directory: Path) -> list[str]:
+    return sorted(
+        path.relative_to(directory).as_posix()
+        for path in directory.rglob("*")
+        if path.is_file() and path.name != "main.json"
+    )
+
+
+def _write_package_artifacts(
+    package_id: str, directory: Path, names: list[str], metadata: dict[str, object]
+) -> None:
+    repository = get_artifact_repository()
+    for name in [*names, "main.json"]:
+        repository.write(
+            package_path(package_id, name),
+            (directory / name).read_bytes(),
         )
+    repository.write(
+        package_path(package_id, "package-metadata.json"),
+        (json.dumps(metadata, indent=2) + "\n").encode(),
+    )
+
+
+def create_package(request: ArchitecturePackageRequest) -> dict[str, object]:
+    required_templates = [
+        CATALOG_ROOT / "main.bicep",
+        CATALOG_ROOT / "modules" / "foundry.bicep",
+        CATALOG_ROOT / "modules" / "storage-container.bicep",
+        CATALOG_ROOT / "modules" / "cosmos-container.bicep",
+    ]
+    missing_templates = [str(path.relative_to(CATALOG_ROOT)) for path in required_templates if not path.is_file()]
+    if missing_templates:
+        raise PackageError("Canonical Bicep template missing: " + ", ".join(missing_templates))
 
     package_id = f"{request.application_id}-g-{str(uuid4())[:8]}"
-    directory = _package_directory(package_id)
-    placeholder_subscription = "00000000-0000-0000-0000-000000000000"
-    manifest = _as_manifest(
-        request,
-        placeholder_subscription,
-    )
+    manifest = _as_manifest(request)
     architecture_plan = create_architecture_plan(
         ArchitecturePlanRequest(
             resources=request.resources,
@@ -156,72 +187,64 @@ def create_package(request: ArchitecturePackageRequest) -> dict[str, object]:
             "Architecture plan is not deployable: "
             + "; ".join(architecture_plan["blockers"])
         )
-    directory.mkdir(parents=True, exist_ok=False)
-    shutil.copy2(CATALOG_ROOT / "main.bicep", directory / "main.bicep")
-    shutil.copy2(CATALOG_ROOT / "resources.bicep", directory / "resources.bicep")
-    parameters = to_bicep_parameters(manifest)
-    parameters["resourceGroupName"] = request.resource_group_name
-    # The stamp is immutable within this package (safe retries) but changes for
-    # every newly approved package, avoiding Cognitive Services soft-delete
-    # name collisions after a prior POC resource group has been removed.
-    parameters["deploymentStamp"] = package_id.rsplit("-", 1)[-1][:6]
-    parameter_text = "using 'main.bicep'\n\n" + "\n".join(
-        f"param {key} = {_bicep_value(value)}" for key, value in parameters.items()
-    ) + "\n"
-    (directory / "main.bicepparam").write_text(parameter_text, encoding="utf-8")
-    (directory / "deployment-manifest.json").write_text(
-        request.model_dump_json(by_alias=True, exclude_none=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (directory / "architecture-plan.json").write_text(
-        json.dumps(architecture_plan, indent=2) + "\n", encoding="utf-8"
-    )
 
-    _compile_bicep(directory)
-    _enforce_foundry_topology(directory)
-    source_files = [
-        "main.bicep",
-        "resources.bicep",
-        "main.bicepparam",
-        "deployment-manifest.json",
-        "architecture-plan.json",
-    ]
-    package_hash = _hash_files(directory, source_files)
-    metadata = {
-        "packageId": package_id,
-        "applicationId": request.application_id,
-        "createdAt": datetime.now(UTC).isoformat(),
-        "sha256": package_hash,
-        "resources": resolve_resources(request.resources),
-        "compiledTemplate": "main.json",
-    }
-    (directory / "package-metadata.json").write_text(
-        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-    )
+    with tempfile.TemporaryDirectory(prefix="launchpad-package-") as temporary:
+        directory = Path(temporary)
+        shutil.copytree(CATALOG_ROOT, directory, dirs_exist_ok=True)
+        parameters = to_bicep_parameters(manifest)
+        parameters["deploymentStamp"] = package_id.rsplit("-", 1)[-1][:6]
+        parameter_text = "using 'main.bicep'\n\n" + "\n".join(
+            f"param {key} = {_bicep_value(value)}" for key, value in parameters.items()
+        ) + "\n"
+        (directory / "main.bicepparam").write_text(parameter_text, encoding="utf-8")
+        (directory / "deployment-manifest.json").write_text(
+            manifest.model_dump_json(by_alias=True, exclude_none=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (directory / "architecture-plan.json").write_text(
+            json.dumps(architecture_plan, indent=2) + "\n", encoding="utf-8"
+        )
+        _compile_bicep(directory)
+        _enforce_existing_resource_topology(directory)
+        source_files = _source_files(directory)
+        package_hash = _hash_files(directory, source_files)
+        metadata = {
+            "packageId": package_id,
+            "applicationId": request.application_id,
+            "createdAt": datetime.now(UTC).isoformat(),
+            "sha256": package_hash,
+            "resources": resolve_resources(request.resources),
+            "compiledTemplate": "main.json",
+            "files": source_files,
+        }
+        _write_package_artifacts(package_id, directory, source_files, metadata)
     return get_package(package_id)
 
 
+def read_package_file(package_id: str, name: str) -> bytes:
+    _validate_package_id(package_id)
+    if name.startswith("/") or ".." in Path(name).parts:
+        raise PackageError("Invalid package file path.")
+    try:
+        return get_artifact_repository().read(package_path(package_id, name))
+    except ArtifactNotFoundError as error:
+        raise PackageError("Generated Bicep package was not found.") from error
+
+
 def get_package(package_id: str) -> dict[str, object]:
-    directory = _package_directory(package_id)
-    if not directory.is_dir():
-        raise PackageError("Generated Bicep package was not found.")
-    metadata = json.loads((directory / "package-metadata.json").read_text(encoding="utf-8"))
-    manifest = ArchitecturePackageRequest.model_validate_json(
-        (directory / "deployment-manifest.json").read_text(encoding="utf-8")
-    )
-    file_names = [
-        "main.bicep",
-        "resources.bicep",
-        "main.bicepparam",
-        "deployment-manifest.json",
-        "package-metadata.json",
-    ]
-    if (directory / "architecture-plan.json").is_file():
-        file_names.insert(4, "architecture-plan.json")
+    try:
+        metadata = json.loads(read_package_file(package_id, "package-metadata.json"))
+        manifest = DeploymentManifest.model_validate_json(
+            read_package_file(package_id, "deployment-manifest.json")
+        )
+    except (json.JSONDecodeError, KeyError, ValueError) as error:
+        raise PackageError("Generated package metadata is invalid.") from error
+    file_names = [str(name) for name in metadata.get("files", [])]
     return {
         **metadata,
+        **manifest.model_dump(by_alias=True, mode="json"),
         "files": [
-            {"path": name, "content": (directory / name).read_text(encoding="utf-8")}
+            {"path": name, "content": read_package_file(package_id, name).decode()}
             for name in file_names
         ],
         "resourceDetails": describe_resources(resolve_resources(manifest.resources)),
@@ -233,9 +256,6 @@ def save_deployment_outputs(
     subscription_id: str,
     deployment: dict[str, object],
 ) -> dict[str, object]:
-    directory = _package_directory(package_id)
-    if not directory.is_dir():
-        raise PackageError("Generated Bicep package was not found.")
     if deployment.get("state") != "Succeeded":
         raise PackageError("Only successful Azure deployment outputs can be recorded.")
     artifact = {
@@ -246,48 +266,52 @@ def save_deployment_outputs(
         "outputs": deployment.get("outputs") or {},
         "resources": deployment.get("resources") or [],
     }
-    (directory / "deployment-outputs.json").write_text(
-        json.dumps(artifact, indent=2) + "\n", encoding="utf-8"
+    get_artifact_repository().write(
+        package_path(package_id, "deployment-outputs.json"),
+        (json.dumps(artifact, indent=2) + "\n").encode(),
+        overwrite=True,
     )
     return artifact
 
 
 def get_deployment_outputs(package_id: str) -> dict[str, object] | None:
-    directory = _package_directory(package_id)
-    path = directory / "deployment-outputs.json"
-    if not path.is_file():
+    try:
+        value = json.loads(read_package_file(package_id, "deployment-outputs.json"))
+    except PackageError:
         return None
-    value = json.loads(path.read_text(encoding="utf-8"))
     return value if isinstance(value, dict) else None
 
 
 def package_manifest(
     package_id: str,
     subscription_id: str,
-) -> tuple[DeploymentManifest, Path, str]:
-    directory = _package_directory(package_id)
-    if not directory.is_dir():
-        raise PackageError("Generated Bicep package was not found.")
-    request = ArchitecturePackageRequest.model_validate_json(
-        (directory / "deployment-manifest.json").read_text(encoding="utf-8")
+) -> tuple[DeploymentManifest, str]:
+    manifest = DeploymentManifest.model_validate_json(
+        read_package_file(package_id, "deployment-manifest.json")
     )
-    metadata = json.loads((directory / "package-metadata.json").read_text(encoding="utf-8"))
-    source_files = [
-        "main.bicep",
-        "resources.bicep",
-        "main.bicepparam",
-        "deployment-manifest.json",
-    ]
-    if (directory / "architecture-plan.json").is_file():
-        source_files.append("architecture-plan.json")
-    current_hash = _hash_files(directory, source_files)
+    if str(manifest.subscription_id) != subscription_id:
+        raise PackageError("Package subscription does not match the configured platform subscription.")
+    metadata = json.loads(read_package_file(package_id, "package-metadata.json"))
+    source_files = [str(name) for name in metadata.get("files", [])]
+    digest = hashlib.sha256()
+    for name in sorted(source_files):
+        digest.update(name.encode("utf-8"))
+        digest.update(read_package_file(package_id, name))
+    current_hash = digest.hexdigest()
     if current_hash != metadata["sha256"]:
         raise PackageError("Generated package integrity check failed; approve a new package.")
-    return (
-        _as_manifest(
-            request,
-            subscription_id,
-        ),
-        directory / "main.bicep",
-        metadata["sha256"],
-    )
+    return manifest, current_hash
+
+
+@contextmanager
+def materialize_package(package_id: str) -> Iterator[Path]:
+    metadata = json.loads(read_package_file(package_id, "package-metadata.json"))
+    with tempfile.TemporaryDirectory(prefix="launchpad-deploy-") as temporary:
+        directory = Path(temporary)
+        for name in metadata.get("files", []):
+            if not str(name).endswith((".bicep", ".bicepparam")):
+                continue
+            target = directory / str(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(read_package_file(package_id, str(name)))
+        yield directory / "main.bicep"

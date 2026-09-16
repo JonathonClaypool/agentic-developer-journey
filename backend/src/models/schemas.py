@@ -10,6 +10,7 @@ ResourceKey = Literal[
     "embedding-model",
     "managed-identity",
     "storage",
+    "cosmos",
     "ai-search",
     "observability",
     "private-network",
@@ -25,6 +26,14 @@ WorkloadName = Annotated[
 ]
 AgentName = Annotated[
     str, StringConstraints(min_length=2, max_length=63, pattern=r"^[a-z0-9-]+$")
+]
+PartitionKeyPath = Annotated[
+    str,
+    StringConstraints(
+        min_length=2,
+        max_length=256,
+        pattern=r"^/[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*$",
+    ),
 ]
 
 
@@ -61,36 +70,44 @@ class OperationalRequirements(ApiModel):
     customer_managed_keys: bool = Field(default=False, alias="customerManagedKeys")
 
 
-class DeploymentManifest(ApiModel):
-    subscription_id: UUID = Field(alias="subscriptionId")
-    location: Annotated[str, StringConstraints(pattern=r"^[a-z0-9]+$")]
-    resource_group_name: ResourceGroupName = Field(alias="resourceGroupName")
-    workload_name: WorkloadName = Field(alias="workloadName")
-    resources: list[ResourceKey] = Field(min_length=1)
-    chat_model: ModelDeployment = Field(alias="chatModel")
-    embedding_model: ModelDeployment | None = Field(default=None, alias="embeddingModel")
-    operational_requirements: OperationalRequirements = Field(
-        default_factory=OperationalRequirements, alias="operationalRequirements"
-    )
-    tags: dict[str, Annotated[str, StringConstraints(max_length=256)]] = Field(
-        default_factory=dict
-    )
+class PlatformResourceReferences(ApiModel):
+    foundry_resource_group: ResourceGroupName = Field(alias="foundryResourceGroup")
+    foundry_account_name: SafeName = Field(alias="foundryAccountName")
+    storage_resource_group: ResourceGroupName = Field(alias="storageResourceGroup")
+    storage_account_name: SafeName = Field(alias="storageAccountName")
+    cosmos_resource_group: ResourceGroupName = Field(alias="cosmosResourceGroup")
+    cosmos_account_name: SafeName = Field(alias="cosmosAccountName")
+    cosmos_database_name: SafeName = Field(alias="cosmosDatabaseName")
+    search_resource_group: ResourceGroupName = Field(alias="searchResourceGroup")
+    search_service_name: SafeName = Field(alias="searchServiceName")
+    search_index_name: SafeName = Field(alias="searchIndexName")
+    managed_identity_resource_id: str = Field(alias="managedIdentityResourceId")
 
 
 class ArchitecturePackageRequest(ApiModel):
+    provisioning_mode: Literal["existing-resources"] = Field(
+        default="existing-resources", alias="provisioningMode"
+    )
     application_id: SafeName = Field(alias="applicationId")
     location: Annotated[str, StringConstraints(pattern=r"^[a-z0-9]+$")]
-    resource_group_name: ResourceGroupName = Field(alias="resourceGroupName")
     workload_name: WorkloadName = Field(alias="workloadName")
     resources: list[ResourceKey] = Field(min_length=1)
     chat_model: ModelDeployment = Field(alias="chatModel")
     embedding_model: ModelDeployment | None = Field(default=None, alias="embeddingModel")
+    cosmos_partition_key_path: PartitionKeyPath = Field(
+        default="/id", alias="cosmosPartitionKeyPath"
+    )
     operational_requirements: OperationalRequirements = Field(
         default_factory=OperationalRequirements, alias="operationalRequirements"
     )
     tags: dict[str, Annotated[str, StringConstraints(max_length=256)]] = Field(
         default_factory=dict
     )
+
+
+class DeploymentManifest(ArchitecturePackageRequest):
+    subscription_id: UUID = Field(alias="subscriptionId")
+    platform_resources: PlatformResourceReferences = Field(alias="platformResources")
 
 
 class ArchitecturePlanRequest(ApiModel):

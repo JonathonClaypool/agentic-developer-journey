@@ -29,6 +29,7 @@ def _infrastructure_changes(
         "embedding-model": "Foundry embedding model deployment",
         "managed-identity": "Managed Identity",
         "storage": "Azure Storage",
+        "cosmos": "Azure Cosmos DB",
         "ai-search": "Azure AI Search",
         "observability": "Application Insights and Log Analytics",
         "private-network": "Virtual Network and private access",
@@ -45,17 +46,24 @@ def _infrastructure_changes(
         }
         if resource == "storage":
             change.update({
-                "status": "upgraded" if production else "unchanged",
-                "current": "Standard_LRS · versioning off · 7-day soft delete",
-                "target": f"{storage_sku} · versioning {'on' if production else 'off'} · {30 if production else 7}-day soft delete",
-                "reason": "Increase data durability and recovery protection." if production else "Development durability is sufficient for the selected service level.",
+                "status": "new",
+                "current": "Platform-managed storage account",
+                "target": "New workload Blob container",
+                "reason": "Isolate workload data without creating another storage account.",
+            })
+        elif resource == "cosmos":
+            change.update({
+                "status": "new",
+                "current": "Platform-managed Cosmos DB account and database",
+                "target": "New workload SQL container",
+                "reason": "Isolate workload state without creating another Cosmos DB account.",
             })
         elif resource == "ai-search":
             change.update({
-                "status": "scaled" if production else "unchanged",
-                "current": "Basic · 1 replica",
-                "target": f"{search_sku.title()} · {search_replicas} {'replicas' if search_replicas != 1 else 'replica'}",
-                "reason": "Increase production query availability." if production else "Development search capacity is sufficient.",
+                "status": "unchanged",
+                "current": "Platform-managed search service and approved index",
+                "target": "Reuse selected index without schema changes",
+                "reason": "Search capacity and schema remain platform managed.",
             })
         elif resource == "observability":
             change.update({
@@ -114,13 +122,16 @@ def create_architecture_plan(request: ArchitecturePlanRequest) -> dict[str, obje
         resources.append({
             "type": "storage",
             "configuration": {
-                "sku": storage_sku,
-                "versioning": production,
-                "softDeleteDays": 30 if production else 7,
-                "immutableRetention": requirements.immutable_audit,
-                "customerManagedKeys": requirements.customer_managed_keys,
+                "parent": "platform-managed",
+                "child": "blob-container",
             },
-            "reason": "Data durability and recovery objectives",
+            "reason": "Workload isolation within the platform storage account",
+        })
+    if "cosmos" in request.resources:
+        resources.append({
+            "type": "cosmos",
+            "configuration": {"parent": "platform-managed", "child": "sql-container"},
+            "reason": "Workload state isolation within the platform Cosmos DB database",
         })
     if "ai-search" in request.resources:
         resources.append({
@@ -130,8 +141,8 @@ def create_architecture_plan(request: ArchitecturePlanRequest) -> dict[str, obje
         })
     resources.append({
         "type": "observability",
-        "configuration": {"retentionDays": log_retention, "diagnosticSettings": production},
-        "reason": "Operational evidence and recovery detection",
+        "configuration": {"source": "platform-managed"},
+        "reason": "Use the platform observability boundary",
     })
 
     if requirements.regulated_records:

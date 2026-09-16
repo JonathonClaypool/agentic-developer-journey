@@ -1,11 +1,17 @@
 import hashlib
 import json
 import shutil
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from models.schemas import AgentStarterKitRequest, ArchitecturePackageRequest
-from .package_generator import PackageError, _package_directory, get_deployment_outputs
+from models.schemas import AgentStarterKitRequest, DeploymentManifest
+from services.artifact_repository import get_artifact_repository, package_path
+from .package_generator import (
+    PackageError,
+    get_deployment_outputs,
+    read_package_file,
+)
 
 KIT_DIRECTORY = "agent-starter-kits"
 
@@ -128,7 +134,9 @@ def _connections_yaml(
 
 
 def _resource_values(
-    manifest: ArchitecturePackageRequest, deployment: dict[str, object] | None
+    manifest: DeploymentManifest,
+    deployment: dict[str, object] | None,
+    package_id: str,
 ) -> dict[str, str]:
     outputs = deployment.get("outputs", {}) if deployment else {}
     values = outputs if isinstance(outputs, dict) else {}
@@ -150,25 +158,54 @@ def _resource_values(
     foundry_endpoint = value("foundryProjectEndpoint")
     if not foundry_endpoint and account_name and project_name:
         foundry_endpoint = f"https://{account_name}.services.ai.azure.com/api/projects/{project_name}"
+    suffix = package_id.rsplit("-", 1)[-1][:6].lower()
+    storage_selected = "storage" in manifest.resources
+    search_selected = "ai-search" in manifest.resources
     return {
         "AZURE_SUBSCRIPTION_ID": str(deployment.get("subscriptionId", "")) if deployment else "",
-        "AZURE_RESOURCE_GROUP": value("resourceGroupName") or manifest.resource_group_name,
+        "AZURE_RESOURCE_GROUP": manifest.platform_resources.foundry_resource_group,
         "FOUNDRY_PROJECT_ENDPOINT": foundry_endpoint,
         "FOUNDRY_PROJECT_RESOURCE_ID": value("foundryProjectResourceId")
         or resource_ids.get("Microsoft.CognitiveServices/accounts/projects", ""),
         "FOUNDRY_ACCOUNT_RESOURCE_ID": value("foundryAccountResourceId")
         or resource_ids.get("Microsoft.CognitiveServices/accounts", ""),
-        "MODEL_DEPLOYMENT_NAME": value("chatModelDeployment") or manifest.chat_model.name,
-        "AZURE_SEARCH_ENDPOINT": value("searchEndpoint")
-        or (f"https://{search_name}.search.windows.net" if search_name else ""),
-        "AZURE_SEARCH_RESOURCE_ID": value("searchResourceId")
-        or resource_ids.get("Microsoft.Search/searchServices", ""),
-        "STORAGE_BLOB_ENDPOINT": value("storageBlobEndpoint")
-        or (f"https://{storage_name}.blob.core.windows.net" if storage_name else ""),
-        "AZURE_STORAGE_RESOURCE_ID": value("storageResourceId")
-        or resource_ids.get("Microsoft.Storage/storageAccounts", ""),
-        "PLATFORM_IDENTITY_RESOURCE_ID": value("identityResourceId")
-        or resource_ids.get("Microsoft.ManagedIdentity/userAssignedIdentities", ""),
+        "MODEL_DEPLOYMENT_NAME": value("chatModelDeployment")
+        or f"{manifest.chat_model.name}-{suffix}",
+        "AZURE_SEARCH_ENDPOINT": (
+            value("searchEndpoint")
+            or (f"https://{search_name}.search.windows.net" if search_name else "")
+        )
+        if search_selected
+        else "",
+        "AZURE_SEARCH_RESOURCE_ID": (
+            value("searchResourceId")
+            or resource_ids.get("Microsoft.Search/searchServices", "")
+        )
+        if search_selected
+        else "",
+        "STORAGE_BLOB_ENDPOINT": (
+            value("storageBlobEndpoint")
+            or (f"https://{storage_name}.blob.core.windows.net" if storage_name else "")
+        )
+        if storage_selected
+        else "",
+        "STORAGE_CONTAINER_NAME": value("storageContainerName")
+        if storage_selected
+        else "",
+        "AZURE_STORAGE_RESOURCE_ID": (
+            value("storageResourceId")
+            or resource_ids.get("Microsoft.Storage/storageAccounts", "")
+        )
+        if storage_selected
+        else "",
+        "COSMOS_ACCOUNT_NAME": value("cosmosAccountName")
+        or manifest.platform_resources.cosmos_account_name,
+        "COSMOS_DATABASE_NAME": value("cosmosDatabaseName")
+        or manifest.platform_resources.cosmos_database_name,
+        "COSMOS_CONTAINER_NAME": value("cosmosContainerName"),
+        "AZURE_SEARCH_INDEX_NAME": value("searchIndexName")
+        or manifest.platform_resources.search_index_name,
+        "PLATFORM_IDENTITY_RESOURCE_ID": manifest.platform_resources.managed_identity_resource_id,
         "PLATFORM_IDENTITY_CLIENT_ID": value("identityClientId"),
     }
 
@@ -176,24 +213,15 @@ def _resource_values(
 def create_agent_starter_kit(
     package_id: str, request: AgentStarterKitRequest
 ) -> dict[str, object]:
-    package_directory = _package_directory(package_id)
-    manifest_path = package_directory / "deployment-manifest.json"
-    if not manifest_path.is_file():
-        raise PackageError("Generated Bicep package was not found.")
-    manifest = ArchitecturePackageRequest.model_validate_json(
-        manifest_path.read_text(encoding="utf-8")
+    manifest = DeploymentManifest.model_validate_json(
+        read_package_file(package_id, "deployment-manifest.json")
     )
     deployment = get_deployment_outputs(package_id)
-    resource_values = _resource_values(manifest, deployment)
+    resource_values = _resource_values(manifest, deployment, package_id)
     if request.include_search and "ai-search" not in manifest.resources:
         raise PackageError("Azure AI Search is not part of the approved infrastructure package.")
 
     kit_id = f"{request.agent_name}-{request.deployment_mode}"
-    directory = package_directory / KIT_DIRECTORY / kit_id
-    if directory.exists():
-        shutil.rmtree(directory)
-    directory.mkdir(parents=True)
-
     env_lines = [
         "# Resource identifiers only. Authenticate locally with Azure CLI; hosted runtime uses its agent identity.",
         f"AZURE_SUBSCRIPTION_ID={resource_values['AZURE_SUBSCRIPTION_ID'] or '<subscription-id>'}",
@@ -205,6 +233,16 @@ def create_agent_starter_kit(
         env_lines.append(f"AZURE_SEARCH_ENDPOINT={resource_values['AZURE_SEARCH_ENDPOINT']}")
     if resource_values["STORAGE_BLOB_ENDPOINT"]:
         env_lines.append(f"STORAGE_BLOB_ENDPOINT={resource_values['STORAGE_BLOB_ENDPOINT']}")
+    if resource_values["STORAGE_CONTAINER_NAME"]:
+        env_lines.append(f"STORAGE_CONTAINER_NAME={resource_values['STORAGE_CONTAINER_NAME']}")
+    if resource_values["COSMOS_CONTAINER_NAME"]:
+        env_lines.extend(
+            [
+                f"COSMOS_ACCOUNT_NAME={resource_values['COSMOS_ACCOUNT_NAME']}",
+                f"COSMOS_DATABASE_NAME={resource_values['COSMOS_DATABASE_NAME']}",
+                f"COSMOS_CONTAINER_NAME={resource_values['COSMOS_CONTAINER_NAME']}",
+            ]
+        )
     if request.mcp_connection:
         env_lines.extend(
             [
@@ -216,7 +254,7 @@ def create_agent_starter_kit(
         env_lines.extend(
             [
                 "AI_SEARCH_CONNECTION_ID=<foundry-project-search-connection-id>",
-                "AI_SEARCH_INDEX_NAME=<approved-index-name>",
+                f"AI_SEARCH_INDEX_NAME={resource_values['AZURE_SEARCH_INDEX_NAME']}",
             ]
         )
     if request.deployment_mode == "jfrog":
@@ -230,7 +268,7 @@ def create_agent_starter_kit(
     files: dict[str, str] = {
         "README.md": f'''# {request.agent_name} governed starter\n\nThis starter is linked to immutable infrastructure package `{package_id}`. It creates no Azure resources and contains no credentials. Non-secret identifiers for resources deployed by this package are populated from the verified Azure deployment output. Developers own the agent instructions, tools, tests, and business behavior.\n\n## Workflow\n\n1. Copy `.env.example` to `.env`; replace only placeholders for external resources that this package did not create.\n2. Sign in locally with Azure CLI; do not add tokens, passwords, or keys to files.\n3. Install the pinned dependencies and run `src/main.py`.\n4. Test the Responses endpoint at `http://localhost:8088/responses`.\n5. Complete `access-request.yaml`; the platform grants the created agent identity only after agent creation.\n6. Run the evaluation gates in `evaluation-plan.yaml`.\n7. Deploy with `azd deploy` after review. Each deployment creates an immutable agent version.\n\n## Deployment mode\n\nSelected mode: **{request.deployment_mode}**. Source mode uses Foundry remote build. JFrog mode references a prebuilt linux/amd64 image and a Foundry `CustomKeys` registry connection that performs OIDC token exchange; no ACR bridge is required.\n''',
         "AGENTS.md": "# Agent development instructions\n\nThis project was built with the microsoft-foundry skill. Before working on or answering questions about foundry agents, read the microsoft-foundry skill first.\n\nKeep credentials out of source. Preserve the Responses protocol, managed identity, APIM boundary, immutable image tags, and evaluation gates.\n",
-        "solution-manifest.yaml": f'''version: 1\napplicationId: {_yaml_string(manifest.application_id)}\ninfrastructurePackageId: {_yaml_string(package_id)}\nworkload: {_yaml_string(manifest.workload_name)}\nregion: {_yaml_string(manifest.location)}\nagent:\n  name: {_yaml_string(request.agent_name)}\n  language: python\n  framework: microsoft-agent-framework\n  protocol: responses\n  hosting: microsoft-foundry-hosted-agent\n  deploymentMode: {request.deployment_mode}\n  existingFoundryProject: true\n  modelDeployment: {_yaml_string(manifest.chat_model.name)}\n  azureAiSearch: {str(request.include_search).lower()}\n''',
+        "solution-manifest.yaml": f'''version: 1\napplicationId: {_yaml_string(manifest.application_id)}\ninfrastructurePackageId: {_yaml_string(package_id)}\nworkload: {_yaml_string(manifest.workload_name)}\nregion: {_yaml_string(manifest.location)}\nagent:\n  name: {_yaml_string(request.agent_name)}\n  language: python\n  framework: microsoft-agent-framework\n  protocol: responses\n  hosting: microsoft-foundry-hosted-agent\n  deploymentMode: {request.deployment_mode}\n  existingFoundryProject: true\n          modelDeployment: {_yaml_string(resource_values["MODEL_DEPLOYMENT_NAME"])}\n  azureAiSearch: {str(request.include_search).lower()}\n''',
         "connections.yaml": _connections_yaml(request, resource_values),
         "deployment-resources.json": json.dumps(
             {
@@ -263,39 +301,58 @@ def create_agent_starter_kit(
         files["Dockerfile"] = '''FROM python:3.13-slim@sha256:<approved-base-image-digest>\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY src ./src\nUSER 10001\nEXPOSE 8088\nCMD ["python", "src/main.py"]\n'''
         files["jfrog-deployment.yaml"] = '''version: 1\nregistry:\n  provider: jfrog-artifactory\n  authentication: oidc-token-exchange\n  foundryConnection:\n    category: CustomKeys\n    idEnv: JFROG_REGISTRY_CONNECTION_ID\nimage:\n  referenceEnv: JFROG_IMAGE_REFERENCE\n  requiredPlatform: linux/amd64\n  immutableTagRequired: true\n  acrBridgeRequired: false\n'''
 
-    for path, content in files.items():
-        _write(directory, path, content)
-    file_names = sorted(files)
-    kit_hash = _hash_files(directory, file_names)
-    metadata = {
-        "kitId": kit_id,
-        "packageId": package_id,
-        "createdAt": datetime.now(UTC).isoformat(),
-        "sha256": kit_hash,
-        "deploymentMode": request.deployment_mode,
-        "includesSearch": request.include_search,
-        "connectionCount": int(request.mcp_connection is not None),
-        "configurationSource": "verified-azure-deployment" if deployment else "immutable-package-plan",
-    }
-    _write(directory, "starter-kit-metadata.json", json.dumps(metadata, indent=2))
-    file_names.append("starter-kit-metadata.json")
-    archive = shutil.make_archive(str(directory), "zip", directory)
+    with tempfile.TemporaryDirectory(prefix="launchpad-starter-") as temporary:
+        directory = Path(temporary) / kit_id
+        directory.mkdir(parents=True)
+        for path, content in files.items():
+            _write(directory, path, content)
+        file_names = sorted(files)
+        kit_hash = _hash_files(directory, file_names)
+        metadata = {
+            "kitId": kit_id,
+            "packageId": package_id,
+            "createdAt": datetime.now(UTC).isoformat(),
+            "sha256": kit_hash,
+            "deploymentMode": request.deployment_mode,
+            "includesSearch": request.include_search,
+            "connectionCount": int(request.mcp_connection is not None),
+            "configurationSource": "verified-azure-deployment" if deployment else "immutable-package-plan",
+        }
+        _write(directory, "starter-kit-metadata.json", json.dumps(metadata, indent=2))
+        file_names.append("starter-kit-metadata.json")
+        archive = Path(shutil.make_archive(str(directory), "zip", directory))
+        repository = get_artifact_repository()
+        prefix = f"{KIT_DIRECTORY}/{kit_id}"
+        for name in file_names:
+            repository.write(
+                package_path(package_id, f"{prefix}/{name}"),
+                (directory / name).read_bytes(),
+                overwrite=True,
+            )
+        repository.write(
+            package_path(package_id, f"{KIT_DIRECTORY}/{kit_id}.zip"),
+            archive.read_bytes(),
+            overwrite=True,
+        )
+        response_files = [
+            {"path": name, "content": (directory / name).read_text(encoding="utf-8")}
+            for name in file_names
+        ]
     return {
         **metadata,
         "downloadUrl": f"/api/packages/{package_id}/agent-starter-kits/{kit_id}/download",
-        "files": [
-            {"path": name, "content": (directory / name).read_text(encoding="utf-8")}
-            for name in file_names
-        ],
-        "archive": Path(archive).name,
+        "files": response_files,
+        "archive": f"{kit_id}.zip",
     }
 
 
-def get_agent_starter_archive(package_id: str, kit_id: str) -> Path:
+def get_agent_starter_archive(package_id: str, kit_id: str) -> tuple[bytes, str]:
     if not kit_id or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in kit_id):
         raise PackageError("Invalid starter kit ID.")
-    package_directory = _package_directory(package_id)
-    archive = package_directory / KIT_DIRECTORY / f"{kit_id}.zip"
-    if not archive.is_file():
-        raise PackageError("Agent starter kit was not found.")
-    return archive
+    try:
+        content = get_artifact_repository().read(
+            package_path(package_id, f"{KIT_DIRECTORY}/{kit_id}.zip")
+        )
+    except FileNotFoundError as error:
+        raise PackageError("Agent starter kit was not found.") from error
+    return content, f"{kit_id}.zip"

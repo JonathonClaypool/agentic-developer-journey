@@ -1,4 +1,22 @@
-export type DeploymentResourceKey = 'foundry'|'chat-model'|'embedding-model'|'managed-identity'|'storage'|'ai-search'|'observability'|'private-network'
+export type DeploymentResourceKey = 'foundry'|'chat-model'|'embedding-model'|'managed-identity'|'storage'|'cosmos'|'ai-search'|'observability'|'private-network'
+
+export type PlatformResources = {
+  provisioningMode:'existing-resources'
+  subscriptionId:string
+  location:string
+  foundryResourceGroup:string
+  foundryAccountName:string
+  storageResourceGroup:string
+  storageAccountName:string
+  cosmosResourceGroup:string
+  cosmosAccountName:string
+  cosmosDatabaseName:string
+  searchResourceGroup:string
+  searchServiceName:string
+  searchIndexName:string
+  managedIdentityResourceId:string
+  createNewResourcesAvailable:false
+}
 
 export type OperationalRequirements = {
   environments:'dev'|'dev-test'|'dev-test-prod';scale:'small'|'medium'|'large'
@@ -21,18 +39,21 @@ export type ArchitecturePlan = {
 }
 
 export type ArchitecturePackageRequest = {
+  provisioningMode:'existing-resources'
   applicationId:string
   location:string
-  resourceGroupName:string
   workloadName:string
   resources:DeploymentResourceKey[]
   chatModel:{name:string;version:string;sku:'GlobalStandard'|'Standard';capacity:number}
   embeddingModel?:{name:string;version:string;sku:'GlobalStandard'|'Standard';capacity:number}
+  cosmosPartitionKeyPath:string
   operationalRequirements:OperationalRequirements
   tags:Record<string,string>
 }
 
 export type GeneratedBicepPackage = ArchitecturePackageRequest & {
+  subscriptionId:string
+  platformResources:Omit<PlatformResources,'provisioningMode'|'subscriptionId'|'location'|'createNewResourcesAvailable'>
   packageId:string
   createdAt:string
   sha256:string

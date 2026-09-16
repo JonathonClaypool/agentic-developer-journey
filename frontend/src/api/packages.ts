@@ -3,6 +3,7 @@ import type {AgentStarterKitRequest,ArchitecturePackageRequest,DeploymentManifes
 
 const resourceKeys:Record<string,DeploymentResourceKey>={
   'Microsoft Foundry':'foundry','Managed Identity':'managed-identity','Azure Blob Storage':'storage','Storage Account':'storage',
+  'Cosmos DB':'cosmos',
   'Azure AI Search':'ai-search','Application Insights':'observability','Virtual Network':'private-network',
   'Foundry embedding model deployment':'embedding-model',
 }
@@ -25,5 +26,5 @@ export const getPackageDeploymentStatus=(packageId:string,deploymentName:string,
 export const createAgentStarterKit=(packageId:string,request:AgentStarterKitRequest)=>api<GeneratedAgentStarterKit>(`/api/packages/${packageId}/agent-starter-kits`,{method:'POST',body:JSON.stringify(request)})
 
 export const previewDeployment=async(manifest:DeploymentManifest)=>createBicepPackage(manifest)
-export const runDeploymentWhatIf=async(_manifest:DeploymentManifest):Promise<{confirmationToken:string}>=>{throw new Error('Approve the architecture to generate a Bicep package first.')}
-export const startDeployment=async(_manifest:DeploymentManifest,_confirmationToken:string):Promise<object>=>{throw new Error('Deploy the approved Bicep package from Provisioning.')}
+export const runDeploymentWhatIf=async(manifest:DeploymentManifest):Promise<{confirmationToken:string}>=>{void manifest;throw new Error('Approve the architecture to generate a Bicep package first.')}
+export const startDeployment=async(manifest:DeploymentManifest,confirmationToken:string):Promise<object>=>{void manifest;void confirmationToken;throw new Error('Deploy the approved Bicep package from Provisioning.')}
