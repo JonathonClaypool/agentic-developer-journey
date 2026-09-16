@@ -6,11 +6,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/backend/src \
     INFRASTRUCTURE_ROOT=/app/catalog/templates/existing-resource-checkout \
     AZURE_CONFIG_DIR=/tmp/.azure \
+    AZURE_BICEP_USE_BINARY_FROM_PATH=true \
+    DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/.dotnet \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+    HOME=/tmp \
     TMPDIR=/tmp/launchpad
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates curl \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
+    && AZURE_BICEP_USE_BINARY_FROM_PATH=false AZURE_CONFIG_DIR=/tmp/azure-cli-build az bicep install \
+    && install -m 0755 /tmp/azure-cli-build/bin/bicep /usr/local/bin/bicep \
+    && rm -rf /tmp/azure-cli-build \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

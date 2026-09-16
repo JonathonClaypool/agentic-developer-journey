@@ -23,6 +23,10 @@ data:
   FRONTEND_ORIGIN: "*"
   LOG_LEVEL: "INFO"
   AZURE_CONFIG_DIR: "/tmp/.azure"
+  AZURE_BICEP_USE_BINARY_FROM_PATH: "true"
+  DOTNET_BUNDLE_EXTRACT_BASE_DIR: "/tmp/.dotnet"
+  DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
+  HOME: "/tmp"
   AZURE_SUBSCRIPTION_ID: "__SUBSCRIPTION_ID__"
   ENABLE_AZURE_DEPLOYMENTS: "__ENABLE_AZURE_DEPLOYMENTS__"
   PACKAGE_ARTIFACT_BACKEND: "blob"
@@ -49,7 +53,12 @@ metadata:
     app.kubernetes.io/name: launchpad-backend
     app.kubernetes.io/part-of: ai-launchpad
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: launchpad-backend
@@ -129,7 +138,12 @@ metadata:
     app.kubernetes.io/name: launchpad-frontend
     app.kubernetes.io/part-of: ai-launchpad
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: launchpad-frontend

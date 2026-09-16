@@ -25,6 +25,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 
 function Read-DotEnv {
@@ -69,6 +71,75 @@ function Invoke-Native {
     }
 }
 
+function New-TrackedBuildContext {
+    param([string]$Root)
+
+    $context = Join-Path ([System.IO.Path]::GetTempPath()) "ai-launchpad-build-$([guid]::NewGuid())"
+    New-Item -ItemType Directory -Path $context | Out-Null
+
+    $trackedFiles = & git -C $Root ls-files
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to enumerate tracked files for the container build context."
+    }
+
+    foreach ($relativePath in $trackedFiles) {
+        $source = Join-Path $Root $relativePath
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            continue
+        }
+        $destination = Join-Path $context $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $destination
+    }
+
+    return $context
+}
+
+function Invoke-AcrBuild {
+    param(
+        [string]$Registry,
+        [string]$Image,
+        [string]$Dockerfile,
+        [string]$Context
+    )
+
+    $runId = & az acr build `
+        --registry $Registry `
+        --image $Image `
+        --file $Dockerfile `
+        --no-logs `
+        --only-show-errors `
+        --query runId `
+        --output tsv `
+        $Context
+    if ($LASTEXITCODE -ne 0 -or -not $runId) {
+        throw "Unable to queue ACR build for $Image."
+    }
+
+    $deadline = (Get-Date).AddMinutes(20)
+    do {
+        $status = & az acr task show-run `
+            --registry $Registry `
+            --run-id $runId `
+            --query status `
+            --output tsv `
+            --only-show-errors
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to read ACR build $runId for $Image."
+        }
+        Write-Host "ACR build $runId for $Image`: $status"
+        if ($status -eq "Succeeded") {
+            return
+        }
+        if ($status -in @("Failed", "Canceled", "Error", "Timeout")) {
+            throw "ACR build $runId for $Image finished with status $status."
+        }
+        Start-Sleep -Seconds 15
+    } while ((Get-Date) -lt $deadline)
+
+    throw "ACR build $runId for $Image did not finish within 20 minutes."
+}
+
 $environmentPath = Join-Path $repositoryRoot $BackendEnvironmentFile
 if (-not (Test-Path -LiteralPath $environmentPath -PathType Leaf)) {
     throw "Backend environment file not found: $environmentPath"
@@ -94,6 +165,7 @@ foreach ($command in @("az", "kubectl")) {
     }
 }
 
+$buildContext = $null
 Push-Location $repositoryRoot
 try {
     Invoke-Native -Command "az" -Arguments @(
@@ -130,23 +202,18 @@ try {
     $acrLoginServer = $outputs.acrLoginServer.value
     $artifactContainerUrl = $outputs.artifactContainerUrl.value
     $backendClientId = $outputs.backendIdentityClientId.value
+    $buildContext = New-TrackedBuildContext -Root $repositoryRoot
 
-    Invoke-Native -Command "az" -Arguments @(
-        "acr", "build",
-        "--registry", $AcrName,
-        "--image", "launchpad-backend:$ImageTag",
-        "--file", "backend/Dockerfile",
-        ".",
-        "--only-show-errors"
-    )
-    Invoke-Native -Command "az" -Arguments @(
-        "acr", "build",
-        "--registry", $AcrName,
-        "--image", "launchpad-frontend:$ImageTag",
-        "--file", "frontend/Dockerfile",
-        ".",
-        "--only-show-errors"
-    )
+    Invoke-AcrBuild `
+        -Registry $AcrName `
+        -Image "launchpad-backend:$ImageTag" `
+        -Dockerfile "backend/Dockerfile" `
+        -Context $buildContext
+    Invoke-AcrBuild `
+        -Registry $AcrName `
+        -Image "launchpad-frontend:$ImageTag" `
+        -Dockerfile "frontend/Dockerfile" `
+        -Context $buildContext
 
     Invoke-Native -Command "az" -Arguments @(
         "aks", "get-credentials",
@@ -216,4 +283,7 @@ try {
 }
 finally {
     Pop-Location
+    if ($buildContext -and (Test-Path -LiteralPath $buildContext)) {
+        Remove-Item -LiteralPath $buildContext -Recurse -Force
+    }
 }
