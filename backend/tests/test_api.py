@@ -66,10 +66,58 @@ PLATFORM_RESOURCES = {
 }
 
 
+def test_azure_cli_uses_aks_workload_identity(monkeypatch, tmp_path: Path) -> None:
+    token_file = tmp_path / "federated-token"
+    token_file.write_text("projected-token")
+    observed: dict[str, object] = {}
+
+    class Result:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command: list[str], **kwargs: object) -> Result:
+        observed["command"] = command
+        observed["environment"] = kwargs["env"]
+        return Result()
+
+    monkeypatch.setattr(azure_deployment.subprocess, "run", fake_run)
+    azure_deployment._login_with_workload_identity(
+        "az",
+        {
+            "AZURE_CLIENT_ID": "client-id",
+            "AZURE_TENANT_ID": "tenant-id",
+            "AZURE_FEDERATED_TOKEN_FILE": str(token_file),
+        },
+        600,
+    )
+
+    assert observed["command"] == [
+        "az",
+        "login",
+        "--service-principal",
+        "--username",
+        "client-id",
+        "--tenant",
+        "tenant-id",
+        "--federated-token",
+        "projected-token",
+        "--allow-no-subscriptions",
+        "--only-show-errors",
+        "--output",
+        "none",
+    ]
+
+
 def test_api_response_has_correlation_id() -> None:
     response = client.get("/api/health", headers={"X-Correlation-ID": "test-request-123"})
     assert response.status_code == 200
     assert response.headers["X-Correlation-ID"] == "test-request-123"
+
+
+def test_readiness_checks_artifact_repository() -> None:
+    response = client.get("/api/health/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "artifactStore": "available"}
 
 
 def test_governance_risk_is_calculated_by_api() -> None:

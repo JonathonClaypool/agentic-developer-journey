@@ -20,6 +20,10 @@ class ArtifactNotFoundError(FileNotFoundError):
 
 class ArtifactRepository(ABC):
     @abstractmethod
+    def check(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def write(self, path: str, content: bytes, *, overwrite: bool = False) -> None:
         raise NotImplementedError
 
@@ -41,6 +45,9 @@ class BlobArtifactRepository(ArtifactRepository):
         self._container = ContainerClient.from_container_url(
             container_url, credential=DefaultAzureCredential()
         )
+
+    def check(self) -> None:
+        self._container.get_container_properties()
 
     def write(self, path: str, content: bytes, *, overwrite: bool = False) -> None:
         self._container.upload_blob(path, content, overwrite=overwrite)
@@ -66,6 +73,9 @@ class FileArtifactRepository(ArtifactRepository):
         if self._root != path and self._root not in path.parents:
             raise ValueError("Invalid artifact path.")
         return path
+
+    def check(self) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
 
     def write(self, path: str, content: bytes, *, overwrite: bool = False) -> None:
         target = self._path(path)

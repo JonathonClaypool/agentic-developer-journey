@@ -7,6 +7,8 @@ Two-application monorepo for the AI Launchpad experience.
 - `frontend/` — independently buildable React, TypeScript, and Vite application.
 - `backend/src/` — FastAPI application source, with a thin composition root in `main.py`.
 - `backend/tests/` — backend tests, separate from production source.
+- `infra/` — deployment assets for running the frontend and backend as containers
+  on an existing AKS cluster, with workload identity and Blob artifact storage.
 - `catalog/templates/existing-resource-checkout/` — Bicep templates for creating
   workload-scoped child assets in backend-configured platform resources.
 - `.runtime/` — ignored local artifact storage used only when the explicit
@@ -82,6 +84,17 @@ archives are stored in the platform-owned Blob container configured by
 `PACKAGE_ARTIFACT_CONTAINER_URL`. Local disk is used only for bounded Bicep
 compilation and ZIP assembly. Set `PACKAGE_ARTIFACT_BACKEND=filesystem` only for
 local development or tests.
+
+## Deploy the portal to AKS
+
+The application deployment is separate from the workload checkout catalog.
+`infra/main.bicep` references an existing AKS cluster, ACR, and Storage account,
+then creates a backend workload identity, a dedicated private artifact container,
+and the required least-privilege role assignments. `infra/deploy.ps1` builds the
+frontend and backend images with ACR Tasks and applies the Kubernetes workloads.
+
+See [`infra/README.md`](infra/README.md) for prerequisites and deployment
+instructions.
 
 Backend responsibilities are separated into `routers/` (HTTP endpoints), `models/`
 (request and response contracts), `services/` (use-case orchestration), `domain/`

@@ -1,0 +1,197 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __NAMESPACE__
+  labels:
+    app.kubernetes.io/part-of: ai-launchpad
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: __SERVICE_ACCOUNT__
+  namespace: __NAMESPACE__
+  annotations:
+    azure.workload.identity/client-id: __BACKEND_CLIENT_ID__
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: launchpad-backend
+  namespace: __NAMESPACE__
+data:
+  PORT: "3001"
+  FRONTEND_ORIGIN: "*"
+  LOG_LEVEL: "INFO"
+  AZURE_CONFIG_DIR: "/tmp/.azure"
+  AZURE_SUBSCRIPTION_ID: "__SUBSCRIPTION_ID__"
+  ENABLE_AZURE_DEPLOYMENTS: "__ENABLE_AZURE_DEPLOYMENTS__"
+  PACKAGE_ARTIFACT_BACKEND: "blob"
+  PACKAGE_ARTIFACT_CONTAINER_URL: "__ARTIFACT_CONTAINER_URL__"
+  PLATFORM_LOCATION: "__PLATFORM_LOCATION__"
+  PLATFORM_FOUNDRY_RESOURCE_GROUP: "__PLATFORM_FOUNDRY_RESOURCE_GROUP__"
+  PLATFORM_FOUNDRY_ACCOUNT_NAME: "__PLATFORM_FOUNDRY_ACCOUNT_NAME__"
+  PLATFORM_STORAGE_RESOURCE_GROUP: "__PLATFORM_STORAGE_RESOURCE_GROUP__"
+  PLATFORM_STORAGE_ACCOUNT_NAME: "__PLATFORM_STORAGE_ACCOUNT_NAME__"
+  PLATFORM_COSMOS_RESOURCE_GROUP: "__PLATFORM_COSMOS_RESOURCE_GROUP__"
+  PLATFORM_COSMOS_ACCOUNT_NAME: "__PLATFORM_COSMOS_ACCOUNT_NAME__"
+  PLATFORM_COSMOS_DATABASE_NAME: "__PLATFORM_COSMOS_DATABASE_NAME__"
+  PLATFORM_SEARCH_RESOURCE_GROUP: "__PLATFORM_SEARCH_RESOURCE_GROUP__"
+  PLATFORM_SEARCH_SERVICE_NAME: "__PLATFORM_SEARCH_SERVICE_NAME__"
+  PLATFORM_SEARCH_INDEX_NAME: "__PLATFORM_SEARCH_INDEX_NAME__"
+  PLATFORM_MANAGED_IDENTITY_RESOURCE_ID: "__PLATFORM_MANAGED_IDENTITY_RESOURCE_ID__"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: launchpad-backend
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: launchpad-backend
+    app.kubernetes.io/part-of: ai-launchpad
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: launchpad-backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: launchpad-backend
+        app.kubernetes.io/part-of: ai-launchpad
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: __SERVICE_ACCOUNT__
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backend
+          image: __ACR_LOGIN_SERVER__/launchpad-backend:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: launchpad-backend
+          ports:
+            - name: http
+              containerPort: 3001
+          readinessProbe:
+            httpGet:
+              path: /api/health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health/live
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: temporary-files
+              mountPath: /tmp
+      volumes:
+        - name: temporary-files
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: launchpad-backend
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: launchpad-backend
+  ports:
+    - name: http
+      port: 3001
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: launchpad-frontend
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: launchpad-frontend
+    app.kubernetes.io/part-of: ai-launchpad
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: launchpad-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: launchpad-frontend
+        app.kubernetes.io/part-of: ai-launchpad
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          image: __ACR_LOGIN_SERVER__/launchpad-frontend:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: nginx-temporary-files
+              mountPath: /tmp
+      volumes:
+        - name: nginx-temporary-files
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: launchpad-frontend
+  namespace: __NAMESPACE__
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: launchpad-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

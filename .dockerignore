@@ -1,0 +1,14 @@
+.git
+.github
+.runtime
+.venv
+.playwright-mcp
+.pytest_cache
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+**/dist
+**/*.pyc
+backend/.env
+frontend/.env
+frontend/.env.local

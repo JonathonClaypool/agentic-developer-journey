@@ -4,6 +4,7 @@ import os
 import signal
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from domain.resource_catalog import to_bicep_parameters
 from models.schemas import DeploymentManifest
 
 logger = logging.getLogger("launchpad.azure")
+_workload_identity_login_lock = threading.Lock()
 
 
 class AzureCommandError(RuntimeError):
@@ -27,6 +29,54 @@ def _parameter_arguments(manifest: DeploymentManifest) -> list[str]:
     ]
 
 
+def _login_with_workload_identity(
+    azure_cli: str, environment: dict[str, str], timeout_seconds: int
+) -> None:
+    client_id = environment.get("AZURE_CLIENT_ID", "").strip()
+    tenant_id = environment.get("AZURE_TENANT_ID", "").strip()
+    token_file = environment.get("AZURE_FEDERATED_TOKEN_FILE", "").strip()
+    configured = [client_id, tenant_id, token_file]
+    if not any(configured):
+        return
+    if not all(configured):
+        raise AzureCommandError(
+            "AKS workload identity is incomplete. AZURE_CLIENT_ID, AZURE_TENANT_ID, "
+            "and AZURE_FEDERATED_TOKEN_FILE must all be configured."
+        )
+
+    token_path = Path(token_file)
+    if not token_path.is_file():
+        raise AzureCommandError("The AKS workload identity token file is unavailable.")
+
+    with _workload_identity_login_lock:
+        result = subprocess.run(
+            [
+                azure_cli,
+                "login",
+                "--service-principal",
+                "--username",
+                client_id,
+                "--tenant",
+                tenant_id,
+                "--federated-token",
+                token_path.read_text().strip(),
+                "--allow-no-subscriptions",
+                "--only-show-errors",
+                "--output",
+                "none",
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=min(timeout_seconds, 60),
+            check=False,
+        )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "Azure workload identity authentication failed."
+        logger.error("azure.workload_identity_login.failed", extra={"error": detail[-2000:]})
+        raise AzureCommandError(detail)
+
+
 def _run_azure(args: list[str], *, expect_json: bool = True) -> Any:
     environment = {**os.environ, "AZURE_CORE_ONLY_SHOW_ERRORS": "true"}
     timeout_seconds = max(30, int(os.getenv("AZURE_COMMAND_TIMEOUT_SECONDS", "600")))
@@ -37,6 +87,11 @@ def _run_azure(args: list[str], *, expect_json: bool = True) -> Any:
     if not azure_cli:
         logger.error("azure.command.missing", extra={"operation": operation})
         raise AzureCommandError("Azure CLI is not installed on the backend host.")
+    try:
+        _login_with_workload_identity(azure_cli, environment, timeout_seconds)
+    except (OSError, subprocess.SubprocessError) as error:
+        logger.exception("azure.workload_identity_login.failed")
+        raise AzureCommandError("Azure workload identity authentication failed.") from error
     try:
         process = subprocess.Popen(
             [azure_cli, *args],
